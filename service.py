@@ -76,23 +76,30 @@ class DeliveryActionFactory:  # Interface
         raise NotImplementedError()
 
 
-class AlwaysPostToLocalhost5555(DeliveryActionFactory):
-    def __init__(self):
+@dataclass()
+class HttpPostDeliveryConfig(object):
+    url: str
+    timeout: timedelta
+
+
+class HttpPostDeliveryMethod(DeliveryActionFactory):
+    def __init__(self, config: HttpPostDeliveryConfig):
+        self.config = config
         self.log = logging.getLogger(self.__class__.__name__)
         self.counter = 0
 
-    def post_to_localhost5555(self, notification: Notification):
-        url = 'http://localhost:5555'
+    def post_notification(self, notification: Notification):
+        url = self.config.url
         body = str(notification)
         self.log.debug(f"Notification {id(notification)} --> {url}")
-        requests.post(url, data=body)
+        requests.post(url, data=body, timeout=self.config.timeout.total_seconds())
         self.counter += 1
 
     def get_delivery_command(self, notification: Notification):
-        def xx():
-            self.post_to_localhost5555(notification)
+        def command():
+            self.post_notification(notification)
 
-        return xx
+        return command
 
     def status_summary(self):
         return {'sent': self.counter}
@@ -184,6 +191,7 @@ class NotificationStorage:
 class SchedulerConfig(object):
     retry_interval: timedelta
     fail_delivery_after: timedelta
+    active_delivery_queue_size: int
 
 
 @dataclass
@@ -231,31 +239,41 @@ class NotificationDeliveryScheduler:
     async def run(self):
         self.log.info(f'Starting main schedule cycle with {self._config}')
         while not self._stopped.is_set():
-            self._create_delivery_attempts()
-            self._run_delivery_attempts()
-            self._register_attempts()
-            self.log.debug(f"Sleeping for {self._config.retry_interval} seconds")
-            await asyncio.sleep(self._config.retry_interval.total_seconds())
+            try:
+                await self._create_delivery_attempts()
+                await self._run_delivery_attempts()
+                self._register_attempts()
+                self.log.debug(f"Sleeping for {self._config.retry_interval} seconds")
+                await asyncio.sleep(self._config.retry_interval.total_seconds())
+            except Exception as e:
+                self.log.exception("Exception in scheduler:", exc_info=e)
 
-    def _create_delivery_attempts(self):
+    async def _create_delivery_attempts(self):
         notifications_to_deliver = tuple(itertools.chain(self._notification_storage.get_queued_notifications(),
                                                          self._notification_storage.unprocessed_from(
                                                              Now() - self._config.fail_delivery_after)))
+
+        n_attempts_to_create = self._config.active_delivery_queue_size - len(self._delivery_jobs)
+        self.log.debug(f"Creating {n_attempts_to_create} attempts to deliver")
         for ntf in notifications_to_deliver:
             idn = id(ntf)
-            self.log.debug(f"Picking up notification {idn}={ntf}")
-            self._notification_storage.pick_for_delivery(ntf)
             if idn not in self._delivery_jobs:
+                n_attempts_to_create -= 1
+                if n_attempts_to_create < 1: break
+                self.log.debug(f"Picking up notification {idn}={ntf}")
+                self._notification_storage.pick_for_delivery(ntf)
                 self.log.debug(f"Delivery job for notification {idn} doesn't exist, creating...")
                 attempt = DeliveryAttempt(Now(), ntf, self._action_factory.get_delivery_command(ntf))
                 self._delivery_jobs[idn] = attempt
                 self.log.debug(f'Created delivery attempt {id(attempt)} for notification {idn}')
 
-    def _run_delivery_attempts(self):  # should be run asynchronously
+    async def _run_delivery_attempts(self):  # should be run asynchronously
         self.log.debug(f'Running {len(self._delivery_jobs)} delivery jobs in the queue')
         attemps_that_never_ran = [d for d in self._delivery_jobs.values() if d.never_ran]
         self.log.debug(f"Running attempts {attemps_that_never_ran}")
-        asyncio.gather(*[create_task(d.run()) for d in attemps_that_never_ran])
+        await asyncio.wait_for(
+            asyncio.gather(*[create_task(d.run()) for d in attemps_that_never_ran]),
+            timeout=10.0)
 
     def _register_attempts(self):
         finished = list()
@@ -269,8 +287,11 @@ class NotificationDeliveryScheduler:
 
     def __call__(self):
         try:
-            asyncio.run(self.run())
+            loop = asyncio.new_event_loop()
+            loop.run_until_complete(self.run())
         except Exception as e:
+            self.log.exception("Exception", exc_info=e)
+            self.log.critical(f"Scheduler died with exception {e}")
             pprint.pprint(e)
             exit(21)
 
@@ -364,13 +385,14 @@ class HTTPRunner:
     def _run_uvicorn(self):
         self.log.info("Starting a new event loop in current thread")
         loop = uvloop.new_event_loop()
-        #loop = asyncio.new_event_loop()
+        # loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         self.log.info("Running the uvicorn")
         from uvicorn import Server, Config
         uvconfig = Config(self._http_app, port=5000, log_level="debug", loop="asyncio")
         self._uv_server = Server(uvconfig)
         self._uv_server.run()
+
 
 class StatsCollector:
     def __init__(self,
@@ -538,6 +560,7 @@ class UvicornHttpWiring(object):
 class ServiceConfig:
     scheduler_config: SchedulerConfig
     retention_config: RetentionConfig
+    http_post_config: HttpPostDeliveryConfig
 
 
 class NotificationServiceBuilder:
@@ -578,7 +601,7 @@ class NotificationServiceBuilder:
 
     @cached_property
     def delivery_factory(self) -> DeliveryActionFactory:
-        return AlwaysPostToLocalhost5555()
+        return HttpPostDeliveryMethod(self.config.http_post_config)
 
     @cached_property
     def http_runner(self) -> HTTPRunner:
@@ -586,7 +609,7 @@ class NotificationServiceBuilder:
 
 
 def configure_root_logger():
-    formatter = logging.Formatter('%(asctime)s %(levelname)s %(threadName)-16s %(name)-24s %(message)s')
+    formatter = logging.Formatter('%(asctime)s %(levelname)-10s %(threadName)-16s %(name)-24s %(message)s')
     logger = logging.getLogger()
     logger.setLevel(logging.DEBUG)
     stdrr = logging.StreamHandler()
@@ -606,11 +629,16 @@ if __name__ == "__main__":
     service_bulder = NotificationServiceBuilder(ServiceConfig(
         scheduler_config=SchedulerConfig(
             fail_delivery_after=timedelta(hours=1),
-            retry_interval=timedelta(milliseconds=500)
+            retry_interval=timedelta(milliseconds=500),
+            active_delivery_queue_size=100
         ),
         retention_config=RetentionConfig(
             check_interval=timedelta(minutes=1),
             archive_notifications_after=timedelta(hours=1)
+        ),
+        http_post_config=HttpPostDeliveryConfig(
+            url="http://localhost:5555",
+            timeout=timedelta(milliseconds=500)
         )
     ))
 
