@@ -1,3 +1,4 @@
+import signal
 from asyncio import create_task
 from dataclasses import dataclass, field
 
@@ -228,13 +229,12 @@ class NotificationDeliveryScheduler:
         self.log = logging.getLogger(self.__class__.__name__)
 
     async def run(self):
-        self._running = True
         self.log.info(f'Starting main schedule cycle with {self._config}')
         while not self._stopped.is_set():
             self._create_delivery_attempts()
             self._run_delivery_attempts()
             self._register_attempts()
-            self.log.debug(f"Slepping for {self._config.retry_interval} seconds")
+            self.log.debug(f"Sleeping for {self._config.retry_interval} seconds")
             await asyncio.sleep(self._config.retry_interval.total_seconds())
 
     def _create_delivery_attempts(self):
@@ -339,6 +339,7 @@ class NotificationServiceFacade(object):
         self._retention_manager.stop()
         self.log.info("Waiting for the retention manager thread to finish")
         self._retention_manager_thread.join()
+        self.log.info("Retention manager thread finished")
 
 
 class HTTPRunner:
@@ -346,32 +347,30 @@ class HTTPRunner:
     def __init__(self, http_app: Callable):
         self._http_app = http_app
         self.log = logging.getLogger(self.__class__.__name__)
+        self._uv_server = None
 
     def start_http(self):
         self.log.info("Starting the HTTP thread")
         self._http_thread = threading.Thread(target=self._run_uvicorn, name="HTTP-Thread")
         self._http_thread.start()
-        #        self._run_uvicorn()
         self.log.info("HTTP thread started")
 
     def stop_http(self):
         self.log.info("Stopping the HTTP thread ")
+        self._uv_server.handle_exit(None, None)
         self.log.info("Waiting for the HTTP thread to finish")
         self._http_thread.join()
 
     def _run_uvicorn(self):
         self.log.info("Starting a new event loop in current thread")
-        # loop = uvloop.new_event_loop()
-        # pprint.pprint(loop)
-        loop = asyncio.new_event_loop()
+        loop = uvloop.new_event_loop()
+        #loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(self.start_uvicorn())
-
-
-    def start_uvicorn(self):
         self.log.info("Running the uvicorn")
-        uvicorn.run(self._http_app, port=5000, log_level="debug", loop="uvloop")
-
+        from uvicorn import Server, Config
+        uvconfig = Config(self._http_app, port=5000, log_level="debug", loop="asyncio")
+        self._uv_server = Server(uvconfig)
+        self._uv_server.run()
 
 class StatsCollector:
     def __init__(self,
@@ -586,8 +585,8 @@ class NotificationServiceBuilder:
         return HTTPRunner(self.uvicorn_http_app)
 
 
-if __name__ == "__main__":
-    formatter = logging.Formatter('%(asctime)s %(threadName)-12s %(name)-12s %(message)s')
+def configure_root_logger():
+    formatter = logging.Formatter('%(asctime)s %(levelname)s %(threadName)-16s %(name)-24s %(message)s')
     logger = logging.getLogger()
     logger.setLevel(logging.DEBUG)
     stdrr = logging.StreamHandler()
@@ -598,13 +597,16 @@ if __name__ == "__main__":
     fh.setFormatter(formatter)
     logger.addHandler(fh)
     logger.addHandler(stdrr)
+    return logger
 
-    # asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
-    app = NotificationServiceBuilder(ServiceConfig(
+if __name__ == "__main__":
+    logger = configure_root_logger()
+
+    service_bulder = NotificationServiceBuilder(ServiceConfig(
         scheduler_config=SchedulerConfig(
             fail_delivery_after=timedelta(hours=1),
-            retry_interval=timedelta(milliseconds=200)
+            retry_interval=timedelta(milliseconds=500)
         ),
         retention_config=RetentionConfig(
             check_interval=timedelta(minutes=1),
@@ -612,9 +614,28 @@ if __name__ == "__main__":
         )
     ))
 
-    app.notification_service.start_sheduler()
-    app.notification_service.start_retention_manager()
-    app.notification_service.add_notification(Notification(recipient="Max", message="Kosyakov"))
-    app.http_runner.start_http()
-    app.notification_service.stop_scheduler()
-    app.notification_service.stop_retention_manager()
+    service_bulder.notification_service.start_sheduler()
+    service_bulder.notification_service.start_retention_manager()
+    service_bulder.notification_service.add_notification(Notification(recipient="max@kosyakov.net", message="Service Started"))
+    service_bulder.http_runner.start_http()
+
+    service_stopped = threading.Event()
+
+
+    def on_signal(signal, frame):
+        logger.info(f"Got signal {signal}")
+        service_stopped.set()
+        logger.info(f"service stopped = {service_stopped}")
+
+
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGHUP, on_signal)
+
+    logger.info("Waiting for the signal to stop")
+    while not service_stopped.is_set():
+        sleep(1.0)
+
+    logger.info("Stopping the service")
+    service_bulder.http_runner.stop_http()
+    service_bulder.notification_service.stop_scheduler()
+    service_bulder.notification_service.stop_retention_manager()
