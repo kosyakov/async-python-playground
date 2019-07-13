@@ -385,7 +385,7 @@ class HTTPRunner:
     def _run_uvicorn(self):
         self.log.info("Starting a new event loop in current thread")
         loop = uvloop.new_event_loop()
-        # loop = asyncio.new_event_loop()
+        #loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         self.log.info("Running the uvicorn")
         from uvicorn import Server, Config
@@ -626,26 +626,27 @@ def configure_root_logger():
 if __name__ == "__main__":
     logger = configure_root_logger()
 
-    service_bulder = NotificationServiceBuilder(ServiceConfig(
+    config = ServiceConfig(
         scheduler_config=SchedulerConfig(
             fail_delivery_after=timedelta(hours=1),
             retry_interval=timedelta(milliseconds=500),
             active_delivery_queue_size=100
         ),
         retention_config=RetentionConfig(
-            check_interval=timedelta(minutes=1),
-            archive_notifications_after=timedelta(hours=1)
+            check_interval=timedelta(seconds=30),
+            archive_notifications_after=timedelta(minutes=10)
         ),
         http_post_config=HttpPostDeliveryConfig(
             url="http://localhost:5555",
-            timeout=timedelta(milliseconds=500)
-        )
-    ))
+            timeout=timedelta(milliseconds=500))
+    )
 
-    service_bulder.notification_service.start_sheduler()
-    service_bulder.notification_service.start_retention_manager()
-    service_bulder.notification_service.add_notification(Notification(recipient="max@kosyakov.net", message="Service Started"))
-    service_bulder.http_runner.start_http()
+    service_builder = NotificationServiceBuilder(config)
+
+    service_builder.notification_service.start_sheduler()
+    service_builder.notification_service.start_retention_manager()
+    service_builder.notification_service.add_notification(Notification(recipient="max@kosyakov.net", message="Service Started"))
+    service_builder.http_runner.start_http()
 
     service_stopped = threading.Event()
 
@@ -664,6 +665,6 @@ if __name__ == "__main__":
         sleep(1.0)
 
     logger.info("Stopping the service")
-    service_bulder.http_runner.stop_http()
-    service_bulder.notification_service.stop_scheduler()
-    service_bulder.notification_service.stop_retention_manager()
+    service_builder.http_runner.stop_http()
+    service_builder.notification_service.stop_scheduler()
+    service_builder.notification_service.stop_retention_manager()
